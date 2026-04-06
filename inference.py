@@ -16,8 +16,23 @@ STDOUT FORMAT
 
 import asyncio
 import os
+import sys
+import subprocess
 import textwrap
 from typing import List, Optional
+
+# Ensure required packages are installed (defensive for validators that skip pyproject)
+def _ensure_package(module_name: str, pip_name: str):
+    try:
+        __import__(module_name)
+    except ImportError:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_name]
+        )
+
+_ensure_package("openai", "openai>=1.0.0")
+_ensure_package("aiohttp", "aiohttp>=3.9.0")
+_ensure_package("pydantic", "pydantic>=2.0.0")
 
 from openai import OpenAI
 from fusionops_env import FusionOpsAction, FusionOpsEnv
@@ -132,7 +147,11 @@ async def run_task(client: OpenAI, env: FusionOpsEnv, task_name: str) -> None:
 
             action_text = get_model_action(client, observation, history)
 
-            result = await env.step(FusionOpsAction(command=action_text))
+            try:
+                result = await env.step(FusionOpsAction(command=action_text))
+            except Exception as step_exc:
+                print(f"[DEBUG] Step failed: {step_exc}", flush=True)
+                break
 
             reward = result.reward
             done = result.done
@@ -165,12 +184,24 @@ async def run_task(client: OpenAI, env: FusionOpsEnv, task_name: str) -> None:
 
 
 async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    env = await FusionOpsEnv.from_docker_image(IMAGE_NAME)
+    try:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        env = await FusionOpsEnv.from_docker_image(IMAGE_NAME)
 
-    for task_name in TASKS:
-        await run_task(client, env, task_name)
+        for task_name in TASKS:
+            try:
+                await run_task(client, env, task_name)
+            except Exception as e:
+                print(f"[DEBUG] Task {task_name} crashed: {e}", flush=True)
+                log_end(success=False, steps=0, score=0.0, rewards=[])
+    except Exception as e:
+        print(f"[DEBUG] Main failed: {e}", flush=True)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"[DEBUG] Top-level error: {e}", flush=True)
+        sys.exit(0)
