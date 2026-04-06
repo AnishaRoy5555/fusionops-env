@@ -212,7 +212,7 @@ The cost model passes 12 golden test cases:
 ```bash
 python tests/test_golden.py
 ```
-# Results: 12 passed, 0 failed out of 12
+Results: 12 passed, 0 failed out of 12
 
 The tests cover:
 - Pointwise fusion with different granularities (3 strategies)
