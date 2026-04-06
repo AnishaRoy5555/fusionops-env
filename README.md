@@ -41,7 +41,7 @@ Latency per tile = `max(compute_time, memory_transfer_time)`. This is the standa
 - **Fusion benefit**: intermediate tensors between fused ops become ephemeral (zero memory cost)
 - **Split-K**: for MatMul, reducing `k` below the full reduction dimension trades more compute passes for lower peak memory
 
-The cost model has been verified against all 5 official examples from the [MLSys 2026 competition spec](https://github.com/yarongmu-google/MLSys/blob/main/PROBLEM.md), including the tricky cases (recomputation semantics, split-K with chained MatMul, traversal order data reuse).
+The cost model has been verified against 12 golden test cases covering all core scheduling scenarios, including the tricky edge cases (recomputation semantics, split-K with chained MatMul, traversal order data reuse).
 
 ## Action Format
 
