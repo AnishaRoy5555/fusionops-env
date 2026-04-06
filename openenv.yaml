@@ -20,3 +20,6 @@ tasks:
   - name: task3_matmul
     description: Chained MatMuls with tight memory. Test split-K and memory management.
     difficulty: hard
+  - name: task4_multistage
+    description: Multi-stage MatMul with skip connection. Test long-horizon planning, split-K, and selective retention.
+    difficulty: expert
