@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "fusionops-env"
+version = "0.1.0"
+description = "ML graph scheduling environment with operator fusion"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
+    "aiohttp",
+]
+
+[project.optional-dependencies]
+inference = [
+    "openai",
+]
