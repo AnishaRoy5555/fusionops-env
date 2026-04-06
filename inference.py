@@ -2,11 +2,11 @@
 Inference Script - FusionOps Environment
 =========================================
 MANDATORY
-- Environment variables:
+- Before submitting, ensure the following variables are defined:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     HF_TOKEN       Your Hugging Face / API key.
-    LOCAL_IMAGE_NAME The name of the local image to use for from_docker_image()
+    LOCAL_IMAGE_NAME  (optional) Docker image name for from_docker_image()
 
 STDOUT FORMAT
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -20,52 +20,44 @@ import textwrap
 from typing import List, Optional
 
 from openai import OpenAI
-
 from fusionops_env import FusionOpsAction, FusionOpsEnv
 
-IMAGE_NAME = os.getenv("IMAGE_NAME")
+IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 BENCHMARK = "fusionops"
+TASKS = ["task1_linear", "task2_diamond", "task3_matmul"]
+MAX_STEPS_PER_TASK = {"task1_linear": 10, "task2_diamond": 12, "task3_matmul": 15}
 TEMPERATURE = 0.3
 MAX_TOKENS = 300
 SUCCESS_SCORE_THRESHOLD = 0.05
-
-TASKS = ["task1_linear", "task2_diamond", "task3_matmul"]
 
 SYSTEM_PROMPT = textwrap.dedent("""
 You are an ML compiler scheduling agent. You schedule operations on a computation graph
 to minimize total execution latency on hardware with limited fast memory.
 
-ENVIRONMENT RULES:
-- Operations are either MatMul or Pointwise
-- You group operations into subgraphs and choose execution granularity [w, h, k]
+RULES:
+- Operations are MatMul or Pointwise
+- Group operations into subgraphs and choose execution granularity [w, h, k]
 - Fusing consecutive ops makes intermediate tensors ephemeral (zero memory cost)
-- The hardware has limited fast memory. Working set must fit or you get OOM
-- For MatMul: LHS slice = [k x h], RHS slice = [w x k], Output = [w x h]
-- For Pointwise: Input/Output slices = [w x h], k is ignored (use k=1)
-- Native granularity is usually [128, 128]. Using smaller tiles wastes compute (padding)
-- Split-K: for MatMul, smaller k means more accumulation steps but less memory
-- Tensors can be retained in fast memory between subgraphs to avoid reloading
+- Working set (input slices + output slices) must fit in fast memory or you get OOM
+- For Pointwise: input/output slices = [w x h], use k=1
+- For MatMul: LHS slice = [k x h], RHS slice = [w x k], output = [w x h]
+- Native granularity is [128, 128]. Smaller tiles waste compute due to padding
+- Split-K: for MatMul, smaller k = more passes but less memory per pass
+- Retain tensors in fast memory between subgraphs to avoid reloading
 
-KEY STRATEGIES:
-1. FUSE adjacent Pointwise ops to eliminate intermediate memory transfers
-2. Use NATIVE GRANULARITY [128, 128, 1] for Pointwise when possible
-3. For MatMul, use full K unless memory forces split-K
-4. RETAIN tensors that will be needed by the next subgraph
-5. For diamonds/branches, keep high-fan-out tensors resident
+STRATEGIES:
+1. Fuse adjacent Pointwise ops in chains
+2. Use native granularity [128,128,1] for Pointwise
+3. For MatMul use full K unless memory forces split-K
+4. Retain tensors needed by the next subgraph
+5. For diamonds, keep high-fan-out tensors resident
 
-ACTION FORMAT (respond with EXACTLY this format, nothing else):
-SCHEDULE ops=[op_id1,op_id2] config=[w,h,k] retain=[tensor_id]
-
-EXAMPLES:
-- Fuse two Pointwise ops: SCHEDULE ops=[0,1] config=[128,128,1] retain=[]
-- Single MatMul with full K: SCHEDULE ops=[2] config=[128,128,128] retain=[]
-- MatMul with split-K: SCHEDULE ops=[0,1] config=[128,128,32] retain=[]
-- Retain a tensor: SCHEDULE ops=[0] config=[128,128,1] retain=[1]
+RESPOND WITH EXACTLY ONE LINE IN THIS FORMAT:
+SCHEDULE ops=[0,1] config=[128,128,1] retain=[]
 """).strip()
 
 
@@ -76,7 +68,6 @@ def log_start(task: str, env: str, model: str) -> None:
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_val = error if error else "null"
     done_val = str(done).lower()
-    # Sanitize action string: remove newlines
     action_clean = action.replace("\n", " ").replace("\r", " ").strip()
     print(
         f"[STEP] step={step} action={action_clean} reward={reward:.2f} done={done_val} error={error_val}",
@@ -92,14 +83,8 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
-def get_model_action(
-    client: OpenAI,
-    observation: str,
-    history: List[str],
-) -> str:
-    """Ask the LLM for the next scheduling action."""
+def get_model_action(client: OpenAI, observation: str, history: List[str]) -> str:
     history_block = "\n".join(history[-4:]) if history else ""
-
     user_prompt = observation
     if history_block:
         user_prompt += f"\n\nPrevious actions:\n{history_block}"
@@ -117,10 +102,9 @@ def get_model_action(
             stream=False,
         )
         text = (completion.choices[0].message.content or "").strip()
-        # Extract just the SCHEDULE line if the model produced extra text
         for line in text.split("\n"):
             line = line.strip()
-            if line.upper().startswith("SCHEDULE"):
+            if "SCHEDULE" in line.upper() or "ops=" in line.lower():
                 return line
         return text if text else "SCHEDULE ops=[0] config=[128,128,1] retain=[]"
     except Exception as exc:
@@ -128,23 +112,19 @@ def get_model_action(
         return "SCHEDULE ops=[0] config=[128,128,1] retain=[]"
 
 
-async def run_task(client: OpenAI, task_name: str) -> tuple[float, int, List[float]]:
-    """Run a single task and return (score, steps, rewards)."""
-    env = await FusionOpsEnv.from_docker_image(IMAGE_NAME)
-
+async def run_task(client: OpenAI, env: FusionOpsEnv, task_name: str) -> None:
     history: List[str] = []
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
+    max_steps = MAX_STEPS_PER_TASK.get(task_name, 15)
 
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result = await env.reset()
+        result = await env.reset(task=task_name)
         observation = result.observation.text
-
-        max_steps = 15  # safety limit
 
         for step in range(1, max_steps + 1):
             if result.done:
@@ -153,30 +133,23 @@ async def run_task(client: OpenAI, task_name: str) -> tuple[float, int, List[flo
             action_text = get_model_action(client, observation, history)
 
             result = await env.step(FusionOpsAction(command=action_text))
-            obs = result.observation
 
-            reward = result.reward or 0.0
+            reward = result.reward
             done = result.done
-            error = getattr(obs, "error", None)
+            error = result.observation.error
 
             rewards.append(reward)
             steps_taken = step
-            observation = obs.text if hasattr(obs, "text") else str(obs)
+            observation = result.observation.text
 
-            log_step(
-                step=step,
-                action=action_text,
-                reward=reward,
-                done=done,
-                error=error,
-            )
-
+            log_step(step=step, action=action_text, reward=reward, done=done, error=error)
             history.append(f"Step {step}: {action_text} -> reward={reward:.2f}")
 
             if done:
+                if result.score is not None:
+                    score = result.score
                 break
 
-        score = getattr(result, "score", 0.0) or 0.0
         score = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
@@ -186,18 +159,17 @@ async def run_task(client: OpenAI, task_name: str) -> tuple[float, int, List[flo
     finally:
         try:
             await env.close()
-        except Exception as e:
-            print(f"[DEBUG] env.close() error: {e}", flush=True)
+        except Exception:
+            pass
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
-    return score, steps_taken, rewards
 
 
 async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    env = await FusionOpsEnv.from_docker_image(IMAGE_NAME)
 
     for task_name in TASKS:
-        score, steps, rewards = await run_task(client, task_name)
+        await run_task(client, env, task_name)
 
 
 if __name__ == "__main__":
