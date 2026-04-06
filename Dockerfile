@@ -8,7 +8,7 @@ WORKDIR /app
 
 COPY --chown=user . /app
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic
+RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic aiohttp
 
 EXPOSE 7860
 
