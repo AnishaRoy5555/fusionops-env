@@ -1,0 +1,22 @@
+spec_version: 1
+name: fusionops
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: >
+  FusionOps is an RL environment for ML computation graph scheduling.
+  Agents learn to fuse operations, manage memory hierarchy, and minimize
+  execution latency on hardware with limited on-chip memory.
+  Based on real ML compiler scheduling challenges (operator fusion,
+  split-K, tensor residency management).
+tasks:
+  - name: task1_linear
+    description: Linear chain of 6 Pointwise ops. Test basic fusion.
+    difficulty: easy
+  - name: task2_diamond
+    description: Diamond graph with skip connections. Test retention decisions.
+    difficulty: medium
+  - name: task3_matmul
+    description: Chained MatMuls with tight memory. Test split-K and memory management.
+    difficulty: hard
