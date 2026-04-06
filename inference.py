@@ -25,10 +25,26 @@ from typing import List, Optional
 def _ensure_package(module_name: str, pip_name: str):
     try:
         __import__(module_name)
+        return
     except ImportError:
+        pass
+    # Try standard install
+    try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", pip_name]
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_name],
+            stderr=subprocess.DEVNULL,
         )
+        return
+    except Exception:
+        pass
+    # Try with --break-system-packages for externally-managed envs
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", pip_name],
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 _ensure_package("openai", "openai>=1.0.0")
 _ensure_package("aiohttp", "aiohttp>=3.9.0")
@@ -43,36 +59,34 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 
 BENCHMARK = "fusionops"
-TASKS = ["task1_linear", "task2_diamond", "task3_matmul"]
-MAX_STEPS_PER_TASK = {"task1_linear": 10, "task2_diamond": 12, "task3_matmul": 15}
+TASKS = ["task1_linear", "task2_diamond", "task3_matmul", "task4_multistage"]
+MAX_STEPS_PER_TASK = {
+    "task1_linear": 10,
+    "task2_diamond": 12,
+    "task3_matmul": 15,
+    "task4_multistage": 20,
+}
 TEMPERATURE = 0.3
 MAX_TOKENS = 300
 SUCCESS_SCORE_THRESHOLD = 0.05
 
 SYSTEM_PROMPT = textwrap.dedent("""
-You are an ML compiler scheduling agent. You schedule operations on a computation graph
-to minimize total execution latency on hardware with limited fast memory.
+You are an agent interacting with an ML graph scheduling environment.
 
-RULES:
-- Operations are MatMul or Pointwise
-- Group operations into subgraphs and choose execution granularity [w, h, k]
-- Fusing consecutive ops makes intermediate tensors ephemeral (zero memory cost)
-- Working set (input slices + output slices) must fit in fast memory or you get OOM
-- For Pointwise: input/output slices = [w x h], use k=1
-- For MatMul: LHS slice = [k x h], RHS slice = [w x k], output = [w x h]
-- Native granularity is [128, 128]. Smaller tiles waste compute due to padding
-- Split-K: for MatMul, smaller k = more passes but less memory per pass
-- Retain tensors in fast memory between subgraphs to avoid reloading
+Each observation contains:
+- LAST ACTION RESULT (only if your previous action was invalid - read this carefully and fix the issue)
+- CURRENT STATE (completed ops, ready ops)
+- VALID ACTION EXAMPLES (use these as templates)
+- CONSTRAINTS and BEST PRACTICES
 
-STRATEGIES:
-1. Fuse adjacent Pointwise ops in chains
-2. Use native granularity [128,128,1] for Pointwise
-3. For MatMul use full K unless memory forces split-K
-4. Retain tensors needed by the next subgraph
-5. For diamonds, keep high-fan-out tensors resident
+Your job:
+- Pick ops only from the READY OPS list
+- Follow the VALID ACTION EXAMPLES format exactly
+- When the previous action failed, READ THE FIX HINT and apply it
+- Goal: minimize total latency by fusing connected ops and reducing memory transfers
 
-RESPOND WITH EXACTLY ONE LINE IN THIS FORMAT:
-SCHEDULE ops=[0,1] config=[128,128,1] retain=[]
+RESPOND WITH EXACTLY ONE LINE IN THIS FORMAT (no explanations, no markdown):
+SCHEDULE ops=[op_ids] config=[w,h,k] retain=[tensor_ids]
 """).strip()
 
 
@@ -147,11 +161,7 @@ async def run_task(client: OpenAI, env: FusionOpsEnv, task_name: str) -> None:
 
             action_text = get_model_action(client, observation, history)
 
-            try:
-                result = await env.step(FusionOpsAction(command=action_text))
-            except Exception as step_exc:
-                print(f"[DEBUG] Step failed: {step_exc}", flush=True)
-                break
+            result = await env.step(FusionOpsAction(command=action_text))
 
             reward = result.reward
             done = result.done
@@ -186,17 +196,19 @@ async def run_task(client: OpenAI, env: FusionOpsEnv, task_name: str) -> None:
 async def main() -> None:
     try:
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-        env = await FusionOpsEnv.from_docker_image(IMAGE_NAME)
-
-        for task_name in TASKS:
-            try:
-                await run_task(client, env, task_name)
-            except Exception as e:
-                print(f"[DEBUG] Task {task_name} crashed: {e}", flush=True)
-                log_end(success=False, steps=0, score=0.0, rewards=[])
     except Exception as e:
-        print(f"[DEBUG] Main failed: {e}", flush=True)
-        sys.exit(0)
+        print(f"[DEBUG] Failed to create OpenAI client: {e}", flush=True)
+        return
+
+    for task_name in TASKS:
+        try:
+            # Fresh env per task to avoid stale session issues
+            env = await FusionOpsEnv.from_docker_image(IMAGE_NAME)
+            await run_task(client, env, task_name)
+        except Exception as e:
+            print(f"[DEBUG] Task {task_name} top-level error: {e}", flush=True)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+            continue
 
 
 if __name__ == "__main__":
