@@ -171,13 +171,13 @@ fusionops-env/
 
 ## Verification
 
-The cost model passes 12 golden tests reproducing every strategy from the [MLSys problem spec](https://github.com/yarongmu-google/MLSys/blob/main/PROBLEM.md):
+The cost model passes 12 golden tests covering all core scheduling scenarios:
 
-- Example 1: Pointwise fusion (strategies A, B, C)
-- Example 2: Large tensor tiling
-- Example 3: Spill vs. recompute vs. selective residency
-- Example 4: MatMul traversal order data reuse (raster vs. snake)
-- Example 5: Chained MatMul with split-K (including OOM detection)
+- Pointwise fusion with different granularities
+- Large tensor tiling across multiple spatial tiles
+- Spill vs. recompute vs. selective residency tradeoffs
+- MatMul traversal order and data reuse patterns
+- Chained MatMul with split-K accumulation and OOM detection
 
 ```bash
 python tests/test_golden.py
