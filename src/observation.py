@@ -1,170 +1,356 @@
 """
 FusionOps Observation Formatter
-Converts environment state into human/LLM-readable text.
+LLM-optimized observation with action hints, error feedback, and progress signal.
 """
 
 from __future__ import annotations
 
-from .models import Graph, OpType, ScheduleState
+from typing import List, Optional, Tuple
+
+from .models import Graph, OpType, ScheduleState, Action, Config
 
 
 def format_observation(
     graph: Graph,
     state: ScheduleState,
     last_action_result: str = "",
+    last_action_error: Optional[dict] = None,
     max_steps: int = 20,
+    naive_latency: float = 0.0,
 ) -> str:
-    """Format the current environment state as readable text for an LLM agent."""
+    """
+    Format the current environment state as LLM-friendly text.
+
+    Args:
+        graph: The computation graph.
+        state: Current schedule state.
+        last_action_result: Text description of last action result (for valid actions).
+        last_action_error: Dict with 'type' and 'reason' if last action failed.
+        max_steps: Maximum allowed steps.
+        naive_latency: Naive baseline latency for progress estimation.
+    """
     hw = graph.hardware
     lines = []
 
-    # Header
-    lines.append("=== FUSIONOPS SCHEDULING STATE ===")
-    lines.append("")
+    # ============================================================
+    # 1. LAST ACTION RESULT (only if there was an error - LLM attention front-loaded)
+    # ============================================================
+    if last_action_error:
+        lines.append("=== LAST ACTION RESULT ===")
+        lines.append("Status: INVALID")
+        lines.append(f"Error Type: {last_action_error.get('type', 'Unknown Error')}")
+        lines.append(f"Reason: {last_action_error.get('reason', 'No details')}")
 
-    # Hardware
-    lines.append("Hardware:")
-    lines.append(f"  Fast Memory Capacity: {hw.fast_memory_capacity}")
-    lines.append(f"  Slow Memory Bandwidth: {hw.slow_memory_bandwidth}")
-    lines.append(f"  Native Granularity: {hw.native_granularity[0]}x{hw.native_granularity[1]}")
-    lines.append("")
-
-    # Last action result
-    if last_action_result:
-        lines.append(f"Last Action Result: {last_action_result}")
+        fix_hint = last_action_error.get('fix_hint')
+        if fix_hint:
+            lines.append("")
+            lines.append("Fix Hint:")
+            lines.append(f"  {fix_hint}")
+        lines.append("")
+    elif last_action_result:
+        lines.append("=== LAST ACTION RESULT ===")
+        lines.append(f"Status: {last_action_result}")
         lines.append("")
 
-    # Progress
-    total_ops = len(graph.operations)
-    scheduled = len(state.scheduled_op_ids)
-    remaining = total_ops - scheduled
-    lines.append(f"Progress: {scheduled}/{total_ops} ops scheduled, Step {state.step_count}/{max_steps}")
-    lines.append(f"Total Latency So Far: {state.total_latency:.1f}")
+    # ============================================================
+    # 2. CURRENT STATE
+    # ============================================================
+    lines.append("=== CURRENT STATE ===")
+    completed_ops = sorted(state.scheduled_op_ids)
+    ready_ops = _find_ready_ops(graph, state)
+    lines.append(f"Completed Ops: {completed_ops}")
+    lines.append(f"Ready Ops: {ready_ops}")
+    lines.append(f"Step: {state.step_count}/{max_steps}")
     lines.append("")
 
-    # Fast memory contents
+    # ============================================================
+    # 3. MEMORY
+    # ============================================================
+    lines.append("=== MEMORY ===")
     if state.tensors_in_fast_memory:
-        lines.append("Tensors in Fast Memory:")
-        total_mem = 0
-        for tid in sorted(state.tensors_in_fast_memory):
-            t = graph.get_tensor(tid)
-            lines.append(f"  T{tid} ({t.width}x{t.height}, size={t.size})")
-            total_mem += t.size
-        lines.append(f"  Total used: {total_mem} / {hw.fast_memory_capacity}")
+        used = sum(graph.get_tensor(tid).size for tid in state.tensors_in_fast_memory)
+        tensor_list = sorted(state.tensors_in_fast_memory)
+        lines.append(f"Fast Memory Tensors: {tensor_list}")
+        lines.append(f"Capacity Used: {used} / {hw.fast_memory_capacity}")
     else:
         lines.append("Fast Memory: empty")
+        lines.append(f"Capacity: 0 / {hw.fast_memory_capacity}")
+    lines.append(f"Slow Memory Bandwidth: {hw.slow_memory_bandwidth}")
+    lines.append(f"Native Granularity: {hw.native_granularity[0]}x{hw.native_granularity[1]}")
     lines.append("")
 
-    # Graph structure (show once, condensed)
-    lines.append("Computation Graph:")
+    # ============================================================
+    # 4. GRAPH SUMMARY
+    # ============================================================
+    lines.append("=== GRAPH SUMMARY ===")
     for op in graph.operations:
         status = "DONE" if op.id in state.scheduled_op_ids else "TODO"
-        in_str = ", ".join(f"T{tid}" for tid in op.input_tensor_ids)
-        out_str = ", ".join(f"T{tid}" for tid in op.output_tensor_ids)
-        lines.append(f"  Op{op.id} [{status}] {op.op_type.value}: [{in_str}] -> [{out_str}] cost={op.base_cost}")
+        in_str = ",".join(f"T{tid}" for tid in op.input_tensor_ids)
+        out_str = ",".join(f"T{tid}" for tid in op.output_tensor_ids)
+        lines.append(f"  Op{op.id} [{status}] {op.op_type.value}: [{in_str}]->[{out_str}] cost={op.base_cost}")
     lines.append("")
 
-    # Tensor info
+    # Tensor info (compact)
     lines.append("Tensors:")
     for t in graph.tensors:
-        origin = ""
+        loc = ""
         if t.id in graph.graph_input_tensor_ids:
-            origin = " (graph input, in slow memory)"
+            loc = "slow_mem (graph input)"
+        elif t.id in state.tensors_in_fast_memory:
+            loc = "fast_mem"
         elif t.id in graph.tensor_producer:
-            prod_op = graph.tensor_producer[t.id]
-            if prod_op in state.scheduled_op_ids:
-                if t.id in state.tensors_in_fast_memory:
-                    origin = f" (produced by Op{prod_op}, in fast memory)"
-                else:
-                    origin = f" (produced by Op{prod_op}, in slow memory)"
+            prod = graph.tensor_producer[t.id]
+            if prod in state.scheduled_op_ids:
+                loc = f"slow_mem (from Op{prod})"
             else:
-                origin = f" (produced by Op{prod_op}, not yet computed)"
-        lines.append(f"  T{t.id}: {t.width}x{t.height}{origin}")
+                loc = f"not_yet_computed (Op{prod})"
+        lines.append(f"  T{t.id}: {t.width}x{t.height} ({loc})")
     lines.append("")
 
-    # Ready operations (all predecessors scheduled)
-    ready_ops = []
+    # ============================================================
+    # 5. VALID ACTION EXAMPLES
+    # ============================================================
+    hints = _generate_action_hints(graph, state)
+    lines.append("=== VALID ACTION EXAMPLES (use as templates) ===")
+    for i, hint in enumerate(hints, 1):
+        lines.append(f"{i}. {hint}")
+    lines.append("")
+
+    # ============================================================
+    # 6. CONSTRAINTS
+    # ============================================================
+    lines.append("=== CONSTRAINTS ===")
+    lines.append("- ops MUST be from READY OPS list above")
+    lines.append("- retain MUST only contain output tensors of the chosen ops")
+    lines.append("- For Pointwise: use config=[128,128,1]")
+    lines.append("- For MatMul: use config=[128,128,K] where K is the reduction dim")
+    lines.append("- Working set must fit in fast memory or you get OOM")
+    lines.append("")
+
+    # ============================================================
+    # 7. BEST PRACTICES (general guidance, not task-specific)
+    # ============================================================
+    lines.append("=== BEST PRACTICES ===")
+    lines.append("- Prefer fusing connected ops to make intermediate tensors ephemeral")
+    lines.append("- Retain tensors that will be used in the very next step")
+    lines.append("- Use native granularity unless memory forces smaller tiles")
+    lines.append("- For MatMul fused with another op, consider split-K (smaller k) to fit memory")
+    lines.append("")
+
+    # ============================================================
+    # 8. PROGRESS
+    # ============================================================
+    lines.append("=== PROGRESS ===")
+    total_ops = len(graph.operations)
+    completed = len(state.scheduled_op_ids)
+    lines.append(f"Completed: {completed}/{total_ops} ops")
+    lines.append(f"Current latency: {state.total_latency:.1f}")
+    if naive_latency > 0:
+        if state.total_latency > 0:
+            efficiency = (naive_latency - state.total_latency) / naive_latency * 100
+            lines.append(f"Naive baseline: {naive_latency:.1f}")
+            lines.append(f"Improvement vs naive: {efficiency:+.1f}%")
+        else:
+            lines.append(f"Naive baseline: {naive_latency:.1f}")
+    lines.append("")
+
+    # ============================================================
+    # 9. ACTION FORMAT REMINDER
+    # ============================================================
+    lines.append("=== ACTION FORMAT ===")
+    lines.append("SCHEDULE ops=[op_ids] config=[w,h,k] retain=[tensor_ids]")
+
+    return "\n".join(lines)
+
+
+def _find_ready_ops(graph: Graph, state: ScheduleState) -> List[int]:
+    """Find ops whose predecessors are all scheduled."""
+    ready = []
     for op in graph.operations:
         if op.id in state.scheduled_op_ids:
             continue
         preds = graph.op_predecessors.get(op.id, set())
         if preds.issubset(state.scheduled_op_ids):
-            ready_ops.append(op.id)
+            ready.append(op.id)
+    return ready
 
-    if ready_ops:
-        lines.append(f"Ready to Schedule: {', '.join(f'Op{oid}' for oid in ready_ops)}")
+
+def _validate_hint(graph: Graph, state: ScheduleState, action_str: str) -> bool:
+    """
+    Test if an action string is actually valid given current state.
+    Runs it through the parser, validator, and cost model.
+    Returns True only if it would not produce any error.
+    """
+    try:
+        # Parse the action
+        import re as _re
+        ops_match = _re.search(r'ops\s*=\s*\[([^\]]*)\]', action_str)
+        config_match = _re.search(r'config\s*=\s*\[(\d+),(\d+),(\d+)\]', action_str)
+        retain_match = _re.search(r'retain\s*=\s*\[([^\]]*)\]', action_str)
+        if not ops_match or not config_match:
+            return False
+
+        ops_str = ops_match.group(1).strip()
+        if not ops_str:
+            return False
+        op_ids = [int(x.strip()) for x in ops_str.split(",") if x.strip()]
+        config = Config(
+            int(config_match.group(1)),
+            int(config_match.group(2)),
+            int(config_match.group(3)),
+        )
+        retain_str = retain_match.group(1).strip() if retain_match else ""
+        retain = [int(x.strip()) for x in retain_str.split(",") if x.strip()] if retain_str else []
+
+        action = Action(
+            operation_ids=op_ids,
+            config=config,
+            tensors_to_retain=retain,
+        )
+
+        # Run validator
+        from .validator import validate_action
+        from .cost_model import compute_subgraph_latency
+
+        # Allow recomputation (clone state and remove ops being scheduled)
+        test_state = state.clone()
+        for oid in op_ids:
+            test_state.scheduled_op_ids.discard(oid)
+
+        validation = validate_action(graph, action, test_state)
+        if not validation.is_valid:
+            return False
+
+        # Run cost model to check OOM
+        result = compute_subgraph_latency(graph, action, test_state)
+        if not result.is_valid:
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
+def _generate_action_hints(graph: Graph, state: ScheduleState) -> List[str]:
+    """
+    Generate 2-4 syntactically valid action examples.
+    Each hint is validated against the actual cost model and validator.
+    Only hints that would actually succeed are returned.
+    """
+    ready_ops = _find_ready_ops(graph, state)
+    candidate_hints = []
+
+    if not ready_ops:
+        return ["SCHEDULE ops=[0] config=[128,128,1] retain=[]"]
+
+    # Candidate 1: Single ready op (always valid)
+    first_op = graph.get_op(ready_ops[0])
+    if first_op.op_type == OpType.MATMUL:
+        lhs = graph.get_tensor(first_op.input_tensor_ids[0])
+        K = lhs.width
+        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,{K}] retain=[]")
     else:
-        lines.append("Ready to Schedule: none (all ops scheduled or blocked)")
-    lines.append("")
+        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,1] retain=[]")
 
-    # Possible fusion groups (hint: adjacent ready ops that share tensors)
+    # Candidate 2: Fusion candidate
+    fusion_pair = _find_fusion_pair(graph, ready_ops, state)
+    if fusion_pair:
+        a, b = fusion_pair
+        op_a = graph.get_op(a)
+        op_b = graph.get_op(b)
+        if op_a.op_type == OpType.POINTWISE and op_b.op_type == OpType.POINTWISE:
+            candidate_hints.append(f"SCHEDULE ops=[{a},{b}] config=[128,128,1] retain=[]")
+        else:
+            # Mixed or MatMul fusion: try multiple split-K values
+            candidate_hints.append(f"SCHEDULE ops=[{a},{b}] config=[128,128,32] retain=[]")
+            candidate_hints.append(f"SCHEDULE ops=[{a},{b}] config=[128,128,16] retain=[]")
+
+    # Candidate 3: Single op with retention
+    if len(first_op.output_tensor_ids) > 0:
+        retain_tid = first_op.output_tensor_ids[0]
+        if retain_tid in graph.tensor_consumers and graph.tensor_consumers[retain_tid]:
+            if first_op.op_type == OpType.MATMUL:
+                lhs = graph.get_tensor(first_op.input_tensor_ids[0])
+                K = lhs.width
+                candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,{K}] retain=[{retain_tid}]")
+            else:
+                candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,1] retain=[{retain_tid}]")
+
+    # Candidate 4: Second single op
     if len(ready_ops) > 1:
-        fusion_hints = _find_fusion_candidates(graph, ready_ops, state)
-        if fusion_hints:
-            lines.append("Possible Fusion Groups:")
-            for group in fusion_hints[:5]:  # limit to 5
-                ops_str = ", ".join(f"Op{oid}" for oid in group)
-                lines.append(f"  [{ops_str}]")
-            lines.append("")
+        second_op = graph.get_op(ready_ops[1])
+        if second_op.op_type == OpType.MATMUL:
+            lhs = graph.get_tensor(second_op.input_tensor_ids[0])
+            K = lhs.width
+            candidate_hints.append(f"SCHEDULE ops=[{second_op.id}] config=[128,128,{K}] retain=[]")
+        else:
+            candidate_hints.append(f"SCHEDULE ops=[{second_op.id}] config=[128,128,1] retain=[]")
 
-    # Schedule history
-    if state.schedule_history:
-        lines.append("Schedule History:")
-        for i, entry in enumerate(state.schedule_history):
-            ops_str = ", ".join(f"Op{oid}" for oid in entry.operation_ids)
-            retain_str = ", ".join(f"T{tid}" for tid in entry.tensors_to_retain) if entry.tensors_to_retain else "none"
-            lines.append(
-                f"  Step {i+1}: ops=[{ops_str}] config=[{entry.config.w},{entry.config.h},{entry.config.k}] "
-                f"retain=[{retain_str}] latency={entry.latency:.1f}"
-            )
-        lines.append("")
+    # Candidate 5: Single op with smaller tile (for memory-tight cases)
+    if first_op.op_type == OpType.MATMUL:
+        lhs = graph.get_tensor(first_op.input_tensor_ids[0])
+        K = lhs.width
+        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[64,64,{K}] retain=[]")
 
-    return "\n".join(lines)
+    # VALIDATE every candidate against actual cost model
+    valid_hints = []
+    for h in candidate_hints:
+        if _validate_hint(graph, state, h):
+            valid_hints.append(h)
+
+    # Always guarantee at least one hint
+    if not valid_hints:
+        # Fallback: try reduced sizes for the first op
+        if first_op.op_type == OpType.MATMUL:
+            lhs = graph.get_tensor(first_op.input_tensor_ids[0])
+            for k in [32, 16, 8]:
+                fallback = f"SCHEDULE ops=[{first_op.id}] config=[64,64,{k}] retain=[]"
+                if _validate_hint(graph, state, fallback):
+                    valid_hints.append(fallback)
+                    break
+        if not valid_hints:
+            # Last resort: just show something
+            valid_hints.append(candidate_hints[0] if candidate_hints else
+                f"SCHEDULE ops=[{ready_ops[0]}] config=[128,128,1] retain=[]")
+
+    return valid_hints[:4]
 
 
-def _find_fusion_candidates(
-    graph: Graph,
-    ready_ops: list[int],
-    state: ScheduleState,
-) -> list[list[int]]:
-    """Find pairs/triples of ready ops that could be fused (share tensors)."""
+def _find_fusion_pair(graph: Graph, ready_ops: List[int], state: ScheduleState = None) -> Optional[Tuple[int, int]]:
+    """
+    Find a producer-consumer pair where:
+    - producer is in ready_ops (or already scheduled and being recomputed)
+    - consumer's other dependencies are satisfied or are graph inputs
+    
+    The consumer doesn't need to be in ready_ops because fusing means scheduling 
+    them together in the same step.
+    """
     ready_set = set(ready_ops)
-    candidates = []
-
-    # Check pairs: op A produces a tensor consumed by op B
-    for oid_a in ready_ops:
-        op_a = graph.get_op(oid_a)
-        for tid in op_a.output_tensor_ids:
+    scheduled = state.scheduled_op_ids if state else set()
+    
+    for op_id in ready_ops:
+        op = graph.get_op(op_id)
+        for tid in op.output_tensor_ids:
             if tid in graph.tensor_consumers:
-                for oid_b in graph.tensor_consumers[tid]:
-                    if oid_b in ready_set and oid_b != oid_a:
-                        pair = sorted([oid_a, oid_b])
-                        if pair not in candidates:
-                            candidates.append(pair)
-
-    # Also check: two ready ops that share the same input tensor
-    # (can potentially be fused if one feeds the other through a chain)
-
-    # Check triples: extend pairs
-    extended = []
-    for pair in candidates:
-        for oid in ready_ops:
-            if oid not in pair:
-                # Check if oid connects to the pair
-                op = graph.get_op(oid)
-                pair_tensors = set()
-                for pid in pair:
-                    p_op = graph.get_op(pid)
-                    pair_tensors.update(p_op.output_tensor_ids)
-                    pair_tensors.update(p_op.input_tensor_ids)
-
-                connected = any(
-                    tid in pair_tensors
-                    for tid in op.input_tensor_ids + op.output_tensor_ids
-                )
-                if connected:
-                    triple = sorted(pair + [oid])
-                    if triple not in extended and triple not in candidates:
-                        extended.append(triple)
-
-    return candidates + extended[:3]
+                for consumer_id in graph.tensor_consumers[tid]:
+                    if consumer_id == op_id:
+                        continue
+                    if consumer_id in scheduled:
+                        continue
+                    # Check consumer's OTHER inputs (besides tid which we're producing)
+                    consumer = graph.get_op(consumer_id)
+                    other_deps_ok = True
+                    for dep_tid in consumer.input_tensor_ids:
+                        if dep_tid == tid:
+                            continue
+                        # Other dep must be either: already scheduled, or a graph input
+                        if dep_tid in graph.graph_input_tensor_ids:
+                            continue
+                        if dep_tid in graph.tensor_producer:
+                            producer = graph.tensor_producer[dep_tid]
+                            if producer not in scheduled:
+                                other_deps_ok = False
+                                break
+                    if other_deps_ok:
+                        return (op_id, consumer_id)
+    return None

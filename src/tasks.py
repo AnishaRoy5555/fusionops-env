@@ -107,6 +107,49 @@ TASK_3_DATA = {
 
 
 # ============================================================
+# TASK 4: Multi-Stage MatMul with Skip Connection (Hardest)
+# ============================================================
+# Graph structure (8 ops, 16 tensors):
+#   T0(128x128), T1(128x128) -> Op0 (MatMul) -> T8
+#   T8 -> Op1 (Pointwise) -> T9
+#   T9, T2(128x128) -> Op2 (MatMul) -> T10
+#   T10 -> Op3 (Pointwise) -> T11
+#   T11, T3(128x128) -> Op4 (MatMul) -> T12
+#   T12 -> Op5 (Pointwise) -> T13
+#   T13, T8 -> Op6 (Pointwise) -> T14   [skip connection from T8]
+#   T14 -> Op7 (Pointwise) -> T15
+#
+# Key challenges:
+# - 3 MatMul ops, each needs split-K when fused with subsequent Pointwise
+# - T8 has 2 consumers far apart (Op1 and Op6) - tests retention reasoning
+# - 8-op chain requires planning horizon
+# - Naive scoring ~0.0, basic fusion ~0.12, smart fusion ~0.25, optimal ~0.30
+# Expected baseline score: 0.05-0.20
+
+TASK_4_DATA = {
+    "widths":  [128] * 16,
+    "heights": [128] * 16,
+    "inputs": [
+        [0, 1],     # Op0 (MatMul): T0 @ T1 -> T8
+        [8],        # Op1 (Pointwise): T8 -> T9
+        [9, 2],     # Op2 (MatMul): T9 @ T2 -> T10
+        [10],       # Op3 (Pointwise): T10 -> T11
+        [11, 3],    # Op4 (MatMul): T11 @ T3 -> T12
+        [12],       # Op5 (Pointwise): T12 -> T13
+        [13, 8],    # Op6 (Pointwise): T13 + T8 -> T14 [skip connection]
+        [14],       # Op7 (Pointwise): T14 -> T15
+    ],
+    "outputs": [[8], [9], [10], [11], [12], [13], [14], [15]],
+    "base_costs": [2000, 400, 2000, 400, 2000, 400, 600, 400],
+    "op_types": ["MatMul", "Pointwise", "MatMul", "Pointwise",
+                 "MatMul", "Pointwise", "Pointwise", "Pointwise"],
+    "fast_memory_capacity": 60000,
+    "slow_memory_bandwidth": 10,
+    "native_granularity": [128, 128],
+}
+
+
+# ============================================================
 # Task registry
 # ============================================================
 
@@ -114,6 +157,7 @@ TASKS = {
     "task1_linear": TASK_1_DATA,
     "task2_diamond": TASK_2_DATA,
     "task3_matmul": TASK_3_DATA,
+    "task4_multistage": TASK_4_DATA,
 }
 
 
@@ -130,6 +174,7 @@ def get_task_config(task_name: str) -> dict:
         "task1_linear": {"max_steps": 10, "description": "Linear chain of 6 Pointwise ops. Test basic fusion."},
         "task2_diamond": {"max_steps": 12, "description": "Diamond graph with skip connections. Test retention decisions."},
         "task3_matmul": {"max_steps": 15, "description": "Chained MatMuls with tight memory. Test split-K and memory management."},
+        "task4_multistage": {"max_steps": 20, "description": "Multi-stage MatMul with skip connection. Test long-horizon planning, split-K, and selective retention."},
     }
     return configs[task_name]
 
