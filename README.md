@@ -2,7 +2,7 @@
 
 An RL environment for ML computation graph scheduling. Agents schedule operations on a DAG under memory constraints, balancing operator fusion, tiling granularity, and tensor residency to minimize total execution latency.
 
-The problem is drawn directly from how ML compilers (XLA, Triton, TVM) schedule workloads on hardware with limited on-chip memory. Google ran a [$50K competition](https://github.com/yarongmu-google/MLSys) on the same underlying problem at MLSys 2026.
+The problem is drawn directly from how ML compilers (XLA, Triton, TVM) schedule workloads on hardware with limited on-chip memory.
 
 ## Why This Exists
 
