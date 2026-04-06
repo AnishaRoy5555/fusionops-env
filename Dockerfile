@@ -1,20 +1,15 @@
 FROM python:3.11-slim
 
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn[standard] \
-    pydantic \
-    websockets
+COPY --chown=user . /app
 
-# Copy source code
-COPY src/ /app/src/
-COPY server/ /app/server/
+RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic
 
-# Expose port
-EXPOSE 8000
+EXPOSE 7860
 
-# Run the server
-CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860"]
