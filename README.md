@@ -1,3 +1,14 @@
+---
+title: FusionOps
+emoji: 🌊
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+tags:
+  - openenv
+---
 # FusionOps
 
 An RL environment for ML computation graph scheduling. Agents schedule operations on a DAG under memory constraints, balancing operator fusion, tiling granularity, and tensor residency to minimize total execution latency.
