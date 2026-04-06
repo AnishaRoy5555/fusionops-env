@@ -54,7 +54,12 @@ class FusionOpsEnv:
         self._last_action_result = ""
 
         obs = format_observation(
-            self.graph, self.state, self._last_action_result, self.max_steps
+            graph=self.graph,
+            state=self.state,
+            last_action_result="",
+            last_action_error=None,
+            max_steps=self.max_steps,
+            naive_latency=self.naive_latency,
         )
 
         return StepResult(
@@ -63,6 +68,84 @@ class FusionOpsEnv:
             done=False,
             info={"naive_latency": self.naive_latency},
         )
+
+    def _classify_error(self, error_msg: str) -> dict:
+        """Classify an error message into type + fix hint for the LLM."""
+        msg = (error_msg or "").lower()
+        ready_ops = self._compute_ready_ops()
+
+        if "oom" in msg or "working set" in msg or "exceeds" in msg:
+            return {
+                "type": "Memory Error (working set too large)",
+                "reason": error_msg,
+                "fix_hint": "Reduce tile size (e.g., config=[64,64,1]) or use split-K (smaller k for MatMul). Working set must fit in fast memory.",
+            }
+        if "dependency" in msg or "needs tensor" in msg or "not scheduled" in msg:
+            return {
+                "type": "Dependency Error (op not ready)",
+                "reason": error_msg,
+                "fix_hint": f"Choose ops only from READY OPS: {ready_ops}",
+            }
+        if "retain" in msg and "not produced" in msg:
+            return {
+                "type": "Retention Error (tensor not produced by current subgraph)",
+                "reason": error_msg,
+                "fix_hint": "You can only retain tensors that the CURRENT subgraph produces (its outputs).",
+            }
+        if "connected" in msg or "subgraph" in msg:
+            return {
+                "type": "Connectivity Error (ops do not form connected subgraph)",
+                "reason": error_msg,
+                "fix_hint": "Ops in a subgraph must form a connected DAG (one op produces a tensor consumed by another in the same subgraph).",
+            }
+        if "parse" in msg or "format" in msg:
+            return {
+                "type": "Parse Error (invalid action format)",
+                "reason": error_msg,
+                "fix_hint": "Use exact format: SCHEDULE ops=[0,1] config=[128,128,1] retain=[]",
+            }
+        if "already scheduled" in msg or "duplicate" in msg:
+            return {
+                "type": "Already Scheduled (op already executed)",
+                "reason": error_msg,
+                "fix_hint": f"This op was already executed. Choose from READY OPS: {ready_ops}",
+            }
+        # Default
+        return {
+            "type": "Invalid Action",
+            "reason": error_msg,
+            "fix_hint": f"Choose ops from READY OPS: {ready_ops}. Use format: SCHEDULE ops=[op_id] config=[128,128,1] retain=[]",
+        }
+
+    def _compute_ready_ops(self) -> list:
+        """Find ops whose predecessors are all scheduled."""
+        if self.state is None:
+            return []
+        ready = []
+        for op in self.graph.operations:
+            if op.id in self.state.scheduled_op_ids:
+                continue
+            preds = self.graph.op_predecessors.get(op.id, set())
+            if preds.issubset(self.state.scheduled_op_ids):
+                ready.append(op.id)
+        return ready
+
+    def _penalty_for_error(self, error_type: str) -> float:
+        """Graduated penalties based on error type."""
+        # Match by prefix to handle the descriptive tags
+        if error_type.startswith("Parse Error"):
+            return -0.10
+        if error_type.startswith("Memory Error"):
+            return -0.05  # Close to valid, just wrong size
+        if error_type.startswith("Dependency Error"):
+            return -0.20  # Clearly wrong order
+        if error_type.startswith("Retention Error"):
+            return -0.15
+        if error_type.startswith("Connectivity Error"):
+            return -0.15
+        if error_type.startswith("Already Scheduled"):
+            return -0.10
+        return -0.10
 
     def step(self, action: Action) -> StepResult:
         """Execute one scheduling step."""
@@ -79,18 +162,24 @@ class FusionOpsEnv:
         validation = validate_action(self.graph, action, state_for_validation)
         if not validation.is_valid:
             self.state.step_count += 1
-            self._last_action_result = f"INVALID: {validation.error}"
+            error_info = self._classify_error(validation.error)
+            penalty = self._penalty_for_error(error_info["type"])
 
             done = self.state.step_count >= self.max_steps
             obs = format_observation(
-                self.graph, self.state, self._last_action_result, self.max_steps
+                graph=self.graph,
+                state=self.state,
+                last_action_result="",
+                last_action_error=error_info,
+                max_steps=self.max_steps,
+                naive_latency=self.naive_latency,
             )
 
             return StepResult(
                 observation=obs,
-                reward=-0.1,  # small penalty for invalid action
+                reward=penalty,
                 done=done,
-                info={"error": validation.error},
+                info={"error": validation.error, "error_type": error_info["type"]},
             )
 
         # Compute latency
@@ -100,18 +189,24 @@ class FusionOpsEnv:
 
         if not result.is_valid:
             self.state.step_count += 1
-            self._last_action_result = f"OOM: {result.error}"
+            error_info = self._classify_error(result.error)
+            penalty = self._penalty_for_error(error_info["type"])
 
             done = self.state.step_count >= self.max_steps
             obs = format_observation(
-                self.graph, self.state, self._last_action_result, self.max_steps
+                graph=self.graph,
+                state=self.state,
+                last_action_result="",
+                last_action_error=error_info,
+                max_steps=self.max_steps,
+                naive_latency=self.naive_latency,
             )
 
             return StepResult(
                 observation=obs,
-                reward=-0.1,
+                reward=penalty,
                 done=done,
-                info={"error": result.error},
+                info={"error": result.error, "error_type": error_info["type"]},
             )
 
         # Update state
@@ -125,13 +220,18 @@ class FusionOpsEnv:
         # Compute reward
         reward = self._compute_reward(result.total_latency, all_ops_covered, done)
 
-        self._last_action_result = (
-            f"OK: latency={result.total_latency:.1f}, "
+        last_result_str = (
+            f"VALID. Latency={result.total_latency:.1f}, "
             f"working_set={result.working_set:.0f}"
         )
 
         obs = format_observation(
-            self.graph, self.state, self._last_action_result, self.max_steps
+            graph=self.graph,
+            state=self.state,
+            last_action_result=last_result_str,
+            last_action_error=None,
+            max_steps=self.max_steps,
+            naive_latency=self.naive_latency,
         )
 
         info = {
@@ -246,8 +346,10 @@ class FusionOpsEnv:
         Compute per-step reward. Higher is better.
         Combines efficiency signal with completion incentive.
         """
+        # Small positive baseline for any valid step (encourages exploration)
+        valid_step_bonus = 0.02
+
         # Base reward: negative normalized latency (lower latency = higher reward)
-        # Normalize by naive per-op average to keep rewards in reasonable range
         avg_naive_per_op = self.naive_latency / len(self.graph.operations)
         latency_reward = -step_latency / avg_naive_per_op * 0.1
 
@@ -260,11 +362,10 @@ class FusionOpsEnv:
         # Completion bonus
         completion_bonus = 0.0
         if done and all_ops_covered:
-            # Big bonus scaled by quality
             score = self.naive_latency / self.state.total_latency
             completion_bonus = score * 0.5
 
-        return latency_reward + fusion_bonus + completion_bonus
+        return valid_step_bonus + latency_reward + fusion_bonus + completion_bonus
 
 
 def parse_action(text: str, graph: Graph) -> Optional[Action]:
