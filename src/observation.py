@@ -132,6 +132,7 @@ def format_observation(
     # ============================================================
     lines.append("=== BEST PRACTICES ===")
     lines.append("- Prefer fusing connected ops to make intermediate tensors ephemeral")
+    lines.append("- Fusion can often be extended beyond 2-3 ops if memory allows")
     lines.append("- Retain tensors that will be used in the very next step")
     lines.append("- Use native granularity unless memory forces smaller tiles")
     lines.append("- For MatMul fused with another op, consider split-K (smaller k) to fit memory")
@@ -243,16 +244,9 @@ def _generate_action_hints(graph: Graph, state: ScheduleState) -> List[str]:
     if not ready_ops:
         return ["SCHEDULE ops=[0] config=[128,128,1] retain=[]"]
 
-    # Candidate 1: Single ready op (always valid)
     first_op = graph.get_op(ready_ops[0])
-    if first_op.op_type == OpType.MATMUL:
-        lhs = graph.get_tensor(first_op.input_tensor_ids[0])
-        K = lhs.width
-        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,{K}] retain=[]")
-    else:
-        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,1] retain=[]")
 
-    # Candidate 2: Fusion candidate
+    # PRIORITY 1: Pair fusion (smallest fusion example)
     fusion_pair = _find_fusion_pair(graph, ready_ops, state)
     if fusion_pair:
         a, b = fusion_pair
@@ -261,11 +255,29 @@ def _generate_action_hints(graph: Graph, state: ScheduleState) -> List[str]:
         if op_a.op_type == OpType.POINTWISE and op_b.op_type == OpType.POINTWISE:
             candidate_hints.append(f"SCHEDULE ops=[{a},{b}] config=[128,128,1] retain=[]")
         else:
-            # Mixed or MatMul fusion: try multiple split-K values
             candidate_hints.append(f"SCHEDULE ops=[{a},{b}] config=[128,128,32] retain=[]")
-            candidate_hints.append(f"SCHEDULE ops=[{a},{b}] config=[128,128,16] retain=[]")
 
-    # Candidate 3: Single op with retention
+    # PRIORITY 2: 3-op chain (shows fusion can extend, capped to avoid leaking optimal)
+    # Pattern: 2-op then 3-op suggests "this can extend further"
+    fusion_chain = _find_fusion_chain(graph, ready_ops, state)
+    if len(fusion_chain) >= 3:
+        chain_to_show = fusion_chain[:3]
+        has_matmul = any(graph.get_op(oid).op_type == OpType.MATMUL for oid in chain_to_show)
+        ops_str = ",".join(str(oid) for oid in chain_to_show)
+        if has_matmul:
+            candidate_hints.append(f"SCHEDULE ops=[{ops_str}] config=[128,128,32] retain=[]")
+        else:
+            candidate_hints.append(f"SCHEDULE ops=[{ops_str}] config=[128,128,1] retain=[]")
+
+    # PRIORITY 3: Single op (always valid baseline)
+    if first_op.op_type == OpType.MATMUL:
+        lhs = graph.get_tensor(first_op.input_tensor_ids[0])
+        K = lhs.width
+        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,{K}] retain=[]")
+    else:
+        candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,1] retain=[]")
+
+    # PRIORITY 4: Single op with retention (for cases where downstream needs it)
     if len(first_op.output_tensor_ids) > 0:
         retain_tid = first_op.output_tensor_ids[0]
         if retain_tid in graph.tensor_consumers and graph.tensor_consumers[retain_tid]:
@@ -276,17 +288,7 @@ def _generate_action_hints(graph: Graph, state: ScheduleState) -> List[str]:
             else:
                 candidate_hints.append(f"SCHEDULE ops=[{first_op.id}] config=[128,128,1] retain=[{retain_tid}]")
 
-    # Candidate 4: Second single op
-    if len(ready_ops) > 1:
-        second_op = graph.get_op(ready_ops[1])
-        if second_op.op_type == OpType.MATMUL:
-            lhs = graph.get_tensor(second_op.input_tensor_ids[0])
-            K = lhs.width
-            candidate_hints.append(f"SCHEDULE ops=[{second_op.id}] config=[128,128,{K}] retain=[]")
-        else:
-            candidate_hints.append(f"SCHEDULE ops=[{second_op.id}] config=[128,128,1] retain=[]")
-
-    # Candidate 5: Single op with smaller tile (for memory-tight cases)
+    # PRIORITY 5: Smaller tile for memory-tight cases
     if first_op.op_type == OpType.MATMUL:
         lhs = graph.get_tensor(first_op.input_tensor_ids[0])
         K = lhs.width
@@ -354,3 +356,71 @@ def _find_fusion_pair(graph: Graph, ready_ops: List[int], state: ScheduleState =
                     if other_deps_ok:
                         return (op_id, consumer_id)
     return None
+
+
+def _find_fusion_chain(graph: Graph, ready_ops: List[int], state: ScheduleState = None) -> List[int]:
+    """
+    Find the longest connected chain of ops starting from a ready op.
+    Returns list of op IDs in execution order. Length 1 if no chain found.
+    
+    A chain is: op_a produces a tensor consumed by op_b, op_b produces a tensor 
+    consumed by op_c, etc. Each op's other dependencies must be satisfied.
+    """
+    if not ready_ops:
+        return []
+
+    scheduled = set(state.scheduled_op_ids) if state else set()
+
+    # BFS to find the longest chain starting from each ready op
+    best_chain = []
+
+    for start_op in ready_ops:
+        chain = [start_op]
+        chain_set = {start_op}
+
+        # Greedy extension: at each step, try to add an op whose only unsatisfied 
+        # dependency is the previous chain output
+        while True:
+            extended = False
+            last_op = graph.get_op(chain[-1])
+
+            # Find ops that consume one of last_op's outputs
+            for tid in last_op.output_tensor_ids:
+                if tid not in graph.tensor_consumers:
+                    continue
+                for next_id in graph.tensor_consumers[tid]:
+                    if next_id in chain_set:
+                        continue
+                    if next_id in scheduled:
+                        continue
+                    next_op = graph.get_op(next_id)
+
+                    # Check if all of next_op's deps are: in chain, scheduled, or graph input
+                    all_deps_ok = True
+                    for dep_tid in next_op.input_tensor_ids:
+                        if dep_tid in graph.graph_input_tensor_ids:
+                            continue
+                        if dep_tid in graph.tensor_producer:
+                            producer = graph.tensor_producer[dep_tid]
+                            if producer in chain_set:
+                                continue
+                            if producer in scheduled:
+                                continue
+                            all_deps_ok = False
+                            break
+
+                    if all_deps_ok:
+                        chain.append(next_id)
+                        chain_set.add(next_id)
+                        extended = True
+                        break
+                if extended:
+                    break
+
+            if not extended:
+                break
+
+        if len(chain) > len(best_chain):
+            best_chain = chain
+
+    return best_chain
